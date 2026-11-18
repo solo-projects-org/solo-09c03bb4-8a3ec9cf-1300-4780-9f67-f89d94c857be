@@ -69,6 +69,30 @@ CREATE TABLE IF NOT EXISTS packages (
 
 CREATE INDEX IF NOT EXISTS idx_packages_claim
     ON packages(status, next_retry_at);
+
+-- One row per unordered cohort pair (cohort_a < cohort_b): querying the same
+-- pair in either order can only ever yield this single current conclusion.
+-- revision_a/revision_b pin the revisions the conclusion belongs to; a done
+-- conclusion is current only while both still equal the cohorts'
+-- current_revision.
+CREATE TABLE IF NOT EXISTS overlap_checks (
+    cohort_a        TEXT NOT NULL,
+    cohort_b        TEXT NOT NULL,
+    revision_a      INTEGER NOT NULL,
+    revision_b      INTEGER NOT NULL,
+    status          TEXT NOT NULL,
+    overlap_count   INTEGER,
+    last_error      TEXT,
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    next_retry_at   TEXT,
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL,
+    PRIMARY KEY (cohort_a, cohort_b),
+    CHECK (cohort_a < cohort_b)
+);
+
+CREATE INDEX IF NOT EXISTS idx_overlap_checks_claim
+    ON overlap_checks(status, next_retry_at);
 """
 
 
@@ -101,6 +125,36 @@ def reset_interrupted_packages() -> None:
                        attempts = 0,
                        updated_at = CURRENT_TIMESTAMP
                  WHERE status IN ('generating', 'failed')
+                """
+            )
+            conn.execute("COMMIT")
+            return cur.rowcount
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
+
+
+def reset_interrupted_checks() -> None:
+    """Startup recovery rule for overlap checks (mirrors packages).
+
+    A check left in ``checking`` means the process died mid-scan; failed
+    checks keep their error notes. Both go back to ``pending`` so the pair
+    stays visible as to-be-checked and is retried without delay.
+    """
+    with write_lock:
+        conn = get_conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cur = conn.execute(
+                """
+                UPDATE overlap_checks
+                   SET status = 'pending',
+                       next_retry_at = NULL,
+                       attempts = 0,
+                       updated_at = CURRENT_TIMESTAMP
+                 WHERE status IN ('checking', 'failed')
                 """
             )
             conn.execute("COMMIT")

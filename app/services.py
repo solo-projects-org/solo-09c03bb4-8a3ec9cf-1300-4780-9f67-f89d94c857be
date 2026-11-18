@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import config, deid
+from . import checks, config, deid
 from .csvutil import Row, canonical_hash, parse_csv
 from .database import get_conn, write_lock
 
@@ -37,6 +37,9 @@ def accept_revision(cohort_id: str, revision_label: str, rows: list[Row], raw: b
     * a new revision supersedes every non-terminal package of the cohort and
       creates a fresh ``pending`` package, so accepting a revision immediately
       withdraws the current eligibility of the old package;
+    * the same transaction re-arms every overlap check involving the cohort,
+      so an old check conclusion loses its currency the moment the revision
+      is accepted;
     * new subjects receive stable pseudonyms and per-subject date shifts,
       existing subjects keep theirs across revisions.
     """
@@ -132,6 +135,12 @@ def accept_revision(cohort_id: str, revision_label: str, rows: list[Row], raw: b
                 "UPDATE cohorts SET current_revision = ? WHERE cohort_id = ?",
                 (revision_label, cohort_id),
             )
+            # Accepting a new revision immediately withdraws every overlap
+            # conclusion involving this cohort; affected pairs are re-armed
+            # to pending against the new current revisions in this same
+            # transaction, and any in-flight scan for the old revisions is
+            # invalidated so its late result can never become current.
+            checks.rearm_checks_for_cohort(conn, cohort_id, now)
             conn.execute("COMMIT")
             return {
                 "status": "accepted",

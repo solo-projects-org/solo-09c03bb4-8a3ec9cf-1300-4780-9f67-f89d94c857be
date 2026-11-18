@@ -47,7 +47,7 @@
 <body>
 <header>
   <h1>随访数据去标识包服务</h1>
-  <p>按队列上传递增修订 · 下载只含稳定假名 / 平移日期 / 测值的去标识包 · 原始身份与日期不出包</p>
+  <p>按队列上传递增修订 · 下载只含稳定假名 / 平移日期 / 测值的去标识包 · 双队列重叠核查只报人数 · 原始身份与日期不出包</p>
 </header>
 
 <main>
@@ -84,12 +84,45 @@
     <h2>② 队列与去标识包</h2>
     <div id="cohortList"><div class="empty">加载中…</div></div>
   </section>
+
+  <section class="card">
+    <h2>③ 双队列重叠核查</h2>
+    <form id="overlapForm">
+      <div class="grid2">
+        <div>
+          <label for="overlapA">队列 A（与顺序无关）</label>
+          <input id="overlapA" type="text" placeholder="例如 cohort-a" required pattern="[A-Za-z0-9_.\-]{1,128}" />
+        </div>
+        <div>
+          <label for="overlapB">队列 B</label>
+          <input id="overlapB" type="text" placeholder="例如 cohort-b" required pattern="[A-Za-z0-9_.\-]{1,128}" />
+        </div>
+      </div>
+      <div style="margin-top:16px">
+        <button type="submit">发起重叠核查</button>
+      </div>
+      <div id="overlapMsg" class="msg"></div>
+      <p class="hint">
+        按双方<strong>当前修订</strong>的受试者号去重求交，只反馈重叠人数：不足 5 人一律显示“少于 5”，
+        原始受试者号与访视日期不会出现在结果中。任一队列受理新修订后，旧结论立即失效并自动按新修订重查；
+        同一对队列（不分先后）只有一份现行结论。核查失败会保留待核查状态并自动重试，重启后仍可见。
+      </p>
+    </form>
+    <div id="overlapList" style="margin-top:14px"><div class="empty">加载中…</div></div>
+  </section>
 </main>
 
 <script>
 const STATUS_TEXT = {
   pending: "待生成", generating: "生成中", published: "已发布",
   failed: "生成失败·自动重试中", superseded: "已被新修订取代"
+};
+
+const CHECK_STATUS_TEXT = {
+  pending: "待核查", checking: "核查中", done: "已出结论", failed: "核查失败·自动重试中"
+};
+const CHECK_BADGE = {
+  pending: "b-pending", checking: "b-generating", done: "b-published", failed: "b-failed"
 };
 
 function showMsg(el, kind, text) {
@@ -150,6 +183,77 @@ function escapeHtml(s) {
     ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[ch]));
 }
 
+async function refreshChecks() {
+  const el = document.getElementById("overlapList");
+  try {
+    const resp = await fetch("/api/overlap-checks");
+    const data = await resp.json();
+    if (!data.checks.length) {
+      el.innerHTML = '<div class="empty">暂无核查记录，请先发起核查</div>';
+      return;
+    }
+    el.innerHTML = renderChecks(data.checks);
+  } catch (e) {
+    el.innerHTML = '<div class="empty" style="color:#dc2626">核查状态加载失败: ' + e + "</div>";
+  }
+}
+
+function renderChecks(checks) {
+  const rows = checks.map(k => {
+    let conclusion;
+    if (k.status === "done" && k.current) {
+      conclusion = k.suppressed ? "<strong>少于 5 人</strong>" : "<strong>" + k.overlap_count + " 人</strong>";
+    } else if (k.status === "done") {
+      conclusion = '<span class="muted">已失效（等待重查）</span>';
+    } else {
+      conclusion = '<span class="muted">—</span>';
+    }
+    const currentBadge = k.status === "done"
+      ? (k.current ? ' <span class="badge b-published">现行</span>'
+                   : ' <span class="badge b-superseded">已失效</span>')
+      : "";
+    const errDetail = k.last_error
+      ? '<div class="err-detail">' + escapeHtml(k.last_error) + "</div>" : "";
+    return "<tr>" +
+      "<td><strong>" + escapeHtml(k.cohort_a) + " × " + escapeHtml(k.cohort_b) + "</strong></td>" +
+      "<td>rev" + escapeHtml(k.revision_a) + " × rev" + escapeHtml(k.revision_b) + "</td>" +
+      '<td><span class="badge ' + (CHECK_BADGE[k.status] || "b-pending") + '">' +
+        (CHECK_STATUS_TEXT[k.status] || k.status) + "</span>" + currentBadge + errDetail + "</td>" +
+      "<td>" + conclusion + "</td>" +
+    "</tr>";
+  }).join("");
+  return "<table><thead><tr><th>队列对</th><th>修订号</th><th>核查状态</th><th>重叠人数</th></tr></thead>" +
+         "<tbody>" + rows + "</tbody></table>";
+}
+
+document.getElementById("overlapForm").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const msg = document.getElementById("overlapMsg");
+  const a = document.getElementById("overlapA").value.trim();
+  const b = document.getElementById("overlapB").value.trim();
+  msg.className = "msg";
+  msg.textContent = "提交中…";
+  msg.style.display = "block";
+  try {
+    const resp = await fetch(
+      "/api/overlap-checks/" + encodeURIComponent(a) + "/" + encodeURIComponent(b),
+      { method: "POST" }
+    );
+    const data = await resp.json().catch(() => ({}));
+    if (resp.ok) {
+      showMsg(msg, "ok", data.status === "done"
+        ? "该队列对已有现行结论（见下表）"
+        : "核查已受理，等待后台扫描双方当前修订");
+    } else {
+      showMsg(msg, "err", "[" + resp.status + "] " +
+        (typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail)));
+    }
+  } catch (e) {
+    showMsg(msg, "err", "请求失败: " + e);
+  }
+  refreshChecks();
+});
+
 async function retryCohort(cohortId) {
   const msg = document.getElementById("uploadMsg");
   const resp = await fetch("/api/cohorts/" + encodeURIComponent(cohortId) + "/retry", {method: "POST"});
@@ -195,7 +299,8 @@ document.getElementById("uploadForm").addEventListener("submit", async (ev) => {
 });
 
 refresh();
-setInterval(refresh, 2500);
+refreshChecks();
+setInterval(() => { refresh(); refreshChecks(); }, 2500);
 </script>
 </body>
 </html>

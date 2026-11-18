@@ -1,4 +1,5 @@
-"""FastAPI application: revision intake, status polling and package download."""
+"""FastAPI application: revision intake, status polling, package download
+and dual-cohort overlap checks."""
 from __future__ import annotations
 
 import logging
@@ -9,9 +10,9 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import config
+from . import checks, config
 from .csvutil import CSVValidationError, parse_csv
-from .database import get_conn, init_db, reset_interrupted_packages
+from .database import get_conn, init_db, reset_interrupted_checks, reset_interrupted_packages
 from .services import ConflictError, accept_revision
 from .worker import PackageWorker
 
@@ -29,6 +30,9 @@ async def lifespan(_app: FastAPI):
     recovered = reset_interrupted_packages()
     if recovered:
         log.info("startup recovery: %d interrupted package(s) back to pending", recovered)
+    recovered_checks = reset_interrupted_checks()
+    if recovered_checks:
+        log.info("startup recovery: %d interrupted check(s) back to pending", recovered_checks)
     worker.start()
     try:
         yield
@@ -38,8 +42,9 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="随访数据去标识包服务",
-    description="按队列受理 CSV 修订并发布只含稳定假名、平移日期与测值的去标识包。",
-    version="1.0.0",
+    description="按队列受理 CSV 修订并发布只含稳定假名、平移日期与测值的去标识包；"
+    "支持双队列受试者重叠核查（只报人数，不足 5 人只显示“少于 5”）。",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -239,6 +244,47 @@ def download_current_package(cohort_id: str):
         )
     finally:
         conn.close()
+
+
+@app.post("/api/overlap-checks/{cohort_a}/{cohort_b}")
+def request_overlap_check(cohort_a: str, cohort_b: str) -> JSONResponse:
+    """Arm an overlap check for a cohort pair's current revisions.
+
+    Order-independent: (A, B) and (B, A) address the same single check row.
+    Idempotent while both revisions are unchanged; a revision change on
+    either side starts a fresh pending check.
+    """
+    if not config.is_valid_identifier(cohort_a) or not config.is_valid_identifier(cohort_b):
+        raise HTTPException(status_code=400, detail="队列 ID 只能包含字母、数字、_ - . 且长度 ≤128")
+    if cohort_a == cohort_b:
+        raise HTTPException(status_code=400, detail="重叠核查需要两个不同的队列")
+    try:
+        result = checks.request_check(cohort_a, cohort_b)
+    except checks.CohortNotReadyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    status_code = 202 if result["outcome"] == "armed" else 200
+    return JSONResponse(status_code=status_code, content=result["check"])
+
+
+@app.get("/api/overlap-checks")
+def list_overlap_checks() -> dict:
+    """Every known pair's check state (pending checks survive restarts)."""
+    return {"checks": checks.list_checks()}
+
+
+@app.get("/api/overlap-checks/{cohort_a}/{cohort_b}")
+def get_overlap_check(cohort_a: str, cohort_b: str) -> dict:
+    """The pair's current conclusion.
+
+    Only revisions and the (possibly suppressed) overlap count are exposed;
+    original subject ids and visit dates never leave the service.
+    """
+    if not config.is_valid_identifier(cohort_a) or not config.is_valid_identifier(cohort_b):
+        raise HTTPException(status_code=400, detail="队列 ID 只能包含字母、数字、_ - . 且长度 ≤128")
+    view = checks.get_check(cohort_a, cohort_b)
+    if view is None:
+        raise HTTPException(status_code=404, detail="该队列对尚无核查记录")
+    return view
 
 
 def _package_view(conn, cohort_id: str, revision_label) -> dict | None:

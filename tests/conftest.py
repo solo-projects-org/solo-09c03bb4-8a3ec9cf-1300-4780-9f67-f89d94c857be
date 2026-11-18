@@ -23,9 +23,11 @@ def app_env(tmp_path, monkeypatch):
     # Reload config so the env vars take effect, then re-import dependent modules.
     from app import config as config_module
     importlib.reload(config_module)
+    from app import checks as checks_module
     from app import database, deid, services, worker as worker_module, main as main_module
     importlib.reload(database)
     importlib.reload(deid)
+    importlib.reload(checks_module)
     importlib.reload(services)
     importlib.reload(worker_module)
     importlib.reload(main_module)
@@ -49,6 +51,8 @@ def app_env(tmp_path, monkeypatch):
                 "config": config_module,
                 "database": database,
                 "services": services,
+                "checks": checks_module,
+                "worker": worker_module,
                 "main": main_module,
             },
             "base": tmp_path,
