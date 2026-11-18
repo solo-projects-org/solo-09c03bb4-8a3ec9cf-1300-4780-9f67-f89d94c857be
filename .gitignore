@@ -1,0 +1,11 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Runtime data (never commit raw uploads, packages or the SQLite database)
+data/
+*.db
+*.db-wal
+*.db-shm
